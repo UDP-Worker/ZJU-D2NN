@@ -3,7 +3,14 @@ import numpy as np
 def read_from_camera() -> np.ndarray:
     return
 
-def write_to_hdmi(picture: np.ndarray) -> None:
+def write_to_hdmi(picture: np.ndarray, channel: int) -> None:
+    if channel == 1:
+        assert picture.shape == # SLM1's pixel shape
+    elif channel == 2:
+        assert picture.shape == # SLM2's pixel shape
+    else:
+        raise NotImplementedError
+
     return
 
 def sample_images(input_pictures: np.ndarray) -> np.ndarray:
