@@ -1,6 +1,6 @@
 import threading
 from typing import Dict, Optional, Tuple
-
+from MvImport.MvCameraControl_class import *
 import cv2
 import numpy as np
 
@@ -92,8 +92,104 @@ class _HDMIDisplayer(threading.Thread):
         cv2.destroyWindow(self.window_name)
 
 
+def decoding_char(ctypes_char_array):
+    """安全地将相机返回的 ctypes 字符数组解码为 Python 字符串（支持中文）"""
+    byte_str = memoryview(ctypes_char_array).tobytes()
+    null_index = byte_str.find(b'\x00')
+    if null_index != -1:
+        byte_str = byte_str[:null_index]
+    for encoding in ['gbk', 'utf-8', 'latin-1']:
+        try:
+            return byte_str.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return byte_str.decode('latin-1', errors='replace')
+
+
 def read_from_camera() -> np.ndarray:
-    return
+    """
+    从连接的 MV-CE060-10UC（或其他 USB 海康相机）抓取一帧图像，
+    返回 BGR 格式的 np.ndarray（shape: H x W x 3, dtype: uint8）。
+
+    已针对 BayerRG8 (PixelType = 0x01080009) 优化并测试可用。
+    每次调用都会自动打开 → 取流 → 抓一帧 → 关闭，适合非实时高频采集场景。
+    """
+    cam = MvCamera()
+
+    # 1. 枚举 USB 设备
+    deviceList = MV_CC_DEVICE_INFO_LIST()
+    ret = MvCamera.MV_CC_EnumDevices(MV_USB_DEVICE, deviceList)
+    if ret != 0:
+        raise RuntimeError(f"枚举相机失败: 0x{ret:x}")
+    if deviceList.nDeviceNum == 0:
+        raise RuntimeError("未检测到任何 USB 相机，请检查相机是否连接并安装驱动")
+
+    # 使用第一台相机
+    stDeviceInfo = cast(deviceList.pDeviceInfo[0], POINTER(MV_CC_DEVICE_INFO)).contents
+
+    # 2. 创建句柄并打开设备
+    ret = cam.MV_CC_CreateHandle(stDeviceInfo)
+    if ret != 0:
+        raise RuntimeError(f"创建相机句柄失败: 0x{ret:x}")
+    ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+    if ret != 0:
+        raise RuntimeError(f"打开相机失败: 0x{ret:x}")
+
+    try:
+        # 3. 设置连续采集模式
+        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        if ret != 0:
+            print(f"警告: 设置 TriggerMode 失败 (0x{ret:x})，可能已是 Off")
+
+        # 4. 开始取流
+        ret = cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            raise RuntimeError(f"开始取流失败: 0x{ret:x}")
+
+        # 5. 获取一帧最大数据量
+        stPayloadSize = MVCC_INTVALUE()
+        memset(byref(stPayloadSize), 0, sizeof(stPayloadSize))
+        ret = cam.MV_CC_GetIntValue("PayloadSize", stPayloadSize)
+        if ret != 0:
+            raise RuntimeError(f"获取 PayloadSize 失败: 0x{ret:x}")
+        nPayloadSize = stPayloadSize.nCurValue
+
+        # 6. 抓取一帧（超时 10 秒）
+        data_buf = (c_ubyte * nPayloadSize)()
+        stFrameInfo = MV_FRAME_OUT_INFO_EX()
+        memset(byref(stFrameInfo), 0, sizeof(stFrameInfo))
+
+        ret = cam.MV_CC_GetOneFrameTimeout(data_buf, nPayloadSize, stFrameInfo, 10000)
+        if ret != 0:
+            raise RuntimeError(f"抓取图像失败: 0x{ret:x}（常见原因：无光照、曝光过长、镜头盖未开）")
+
+        # 7. 转为 numpy 并进行 Bayer 去马赛克
+        img_buffer = np.frombuffer(data_buf, dtype=np.uint8, count=stFrameInfo.nFrameLen)
+
+        pixel_type = stFrameInfo.enPixelType
+        height = stFrameInfo.nHeight
+        width = stFrameInfo.nWidth
+
+        if pixel_type == 0x01080009:  # BayerRG8 —— 你的相机默认格式
+            raw_bayer = img_buffer.reshape(height, width)
+            frame = cv2.cvtColor(raw_bayer, cv2.COLOR_BAYER_BG2BGR)  # OpenCV 中 BayerRG 对应 BG
+        elif pixel_type == PixelType_Gvsp_Mono8:
+            gray = img_buffer.reshape(height, width)
+            frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        elif pixel_type in [PixelType_Gvsp_RGB8_Packed, PixelType_Gvsp_BGR8_Packed]:
+            frame = img_buffer.reshape(height, width, 3)
+            if pixel_type == PixelType_Gvsp_RGB8_Packed:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        else:
+            raise RuntimeError(f"当前相机像素格式 0x{pixel_type:08x} 暂不支持，请在 MVS 客户端改为 BayerRG8 或 RGB8")
+
+        return frame.copy()
+
+    finally:
+        # 8. 清理资源
+        cam.MV_CC_StopGrabbing()
+        cam.MV_CC_CloseDevice()
+        cam.MV_CC_DestroyHandle()
 
 def write_to_hdmi(picture: np.ndarray, channel: int) -> None:
     """
