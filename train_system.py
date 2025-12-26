@@ -101,5 +101,5 @@ def build_first_half_model() -> nn.Module:
     layers.append(...) # Lens propagation of L1
     layers.append(...) # free propagation from L1 to SLM2
     layers.append(...) # offset of SLM2
-    first_half_model = nn.Sequential(*layer)
+    first_half_model = nn.Sequential(*layers)
     return first_half_model
