@@ -10,6 +10,8 @@ import math
 import torch
 from torch import nn
 
+import pytorch_utils as ptu
+
 class FreePropagation(nn.Module):
     """
     Free-space propagation using Angular Spectrum Method (ASM).
@@ -84,3 +86,20 @@ class FreePropagation(nn.Module):
 
         return U2
 
+class LensPropagation(nn.Module):
+    # TODO: a nn.Module to describe a lens' effect on propagation
+
+class OffsetProcess(nn.Module):
+    # TODO: a nn.Module to describe tilting, offset effect of SLMs and cameras.
+
+
+
+def build_first_half_model() -> nn.Module:
+    # TODO: build optical system
+    layers = []
+    layers.append(...) # free propagation from SLM1 to lens L1 (the first lens of 4f system)
+    layers.append(...) # Lens propagation of L1
+    layers.append(...) # free propagation from L1 to SLM2
+    layers.append(...) # offset of SLM2
+    first_half_model = nn.Sequential(*layer)
+    return first_half_model
