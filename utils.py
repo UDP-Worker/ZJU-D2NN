@@ -1,5 +1,7 @@
+import sys
 import threading
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 from MvImport.MvCameraControl_class import *
 import cv2
 import numpy as np
@@ -14,6 +16,94 @@ _REFRESH_HZ = 30
 
 _display_threads: Dict[int, "_HDMIDisplayer"] = {}
 _display_threads_lock = threading.Lock()
+_IS_WINDOWS = sys.platform.startswith("win")
+
+
+@dataclass(frozen=True)
+class _MonitorInfo:
+    index: int
+    device_name: str
+    display_name: str
+    left: int
+    top: int
+    width: int
+    height: int
+
+
+def _enumerate_windows_monitors() -> List[_MonitorInfo]:
+    if not _IS_WINDOWS:
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+            ("szDevice", wintypes.WCHAR * 32),
+        ]
+
+    class DISPLAY_DEVICEW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("DeviceName", wintypes.WCHAR * 32),
+            ("DeviceString", wintypes.WCHAR * 128),
+            ("StateFlags", wintypes.DWORD),
+            ("DeviceID", wintypes.WCHAR * 128),
+            ("DeviceKey", wintypes.WCHAR * 128),
+        ]
+
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+
+    monitors: List[_MonitorInfo] = []
+
+    @MonitorEnumProc
+    def _callback(hmonitor, hdc, lprect, lparam):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            return True
+
+        display_device = DISPLAY_DEVICEW()
+        display_device.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+
+        display_name = info.szDevice
+        device_name = info.szDevice
+        if user32.EnumDisplayDevicesW(info.szDevice, 0, ctypes.byref(display_device), 0):
+            if display_device.DeviceString:
+                display_name = display_device.DeviceString
+            if display_device.DeviceName:
+                device_name = display_device.DeviceName
+
+        rect = info.rcMonitor
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        monitors.append(
+            _MonitorInfo(
+                index=len(monitors) + 1,
+                device_name=device_name,
+                display_name=display_name,
+                left=rect.left,
+                top=rect.top,
+                width=width,
+                height=height,
+            )
+        )
+        return True
+
+    user32.EnumDisplayMonitors(None, None, _callback, 0)
+    return monitors
 
 
 def _to_uint8(frame: np.ndarray) -> np.ndarray:
@@ -33,11 +123,18 @@ def _to_uint8(frame: np.ndarray) -> np.ndarray:
 class _HDMIDisplayer(threading.Thread):
     """Lightweight background loop that keeps the most recent frame on screen."""
 
-    def __init__(self, channel: int, expected_shape: Tuple[int, int]):
+    def __init__(
+        self,
+        channel: int,
+        expected_shape: Tuple[int, int],
+        window_name: str,
+        monitor: Optional[_MonitorInfo] = None,
+    ):
         super().__init__(daemon=True)
         self.channel = channel
         self.expected_shape = expected_shape
-        self.window_name = _WINDOW_TITLES[channel]
+        self.window_name = window_name
+        self.monitor = monitor
         self._frame_lock = threading.Lock()
         self._frame_ready = threading.Event()
         self._stop = threading.Event()
@@ -60,6 +157,9 @@ class _HDMIDisplayer(threading.Thread):
     def run(self) -> None:
         try:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            if self.monitor is not None:
+                cv2.moveWindow(self.window_name, self.monitor.left, self.monitor.top)
+                cv2.resizeWindow(self.window_name, self.monitor.width, self.monitor.height)
             cv2.setWindowProperty(self.window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         except cv2.error as exc:  # pragma: no cover - GUI init errors are environment dependent
             self._last_error = exc
@@ -104,6 +204,39 @@ def decoding_char(ctypes_char_array):
         except UnicodeDecodeError:
             continue
     return byte_str.decode('latin-1', errors='replace')
+
+
+def list_hdmi_outputs() -> List[Dict[str, object]]:
+    """
+    List available outputs for HDMI display.
+
+    On Windows this returns active monitors (HDMI/DP/VGA are not always distinguishable).
+    """
+    outputs: List[Dict[str, object]] = []
+    if _IS_WINDOWS:
+        monitors = _enumerate_windows_monitors()
+        for monitor in monitors:
+            outputs.append(
+                {
+                    "index": monitor.index,
+                    "name": monitor.display_name or monitor.device_name,
+                    "device": monitor.device_name,
+                    "resolution": (monitor.width, monitor.height),
+                    "position": (monitor.left, monitor.top),
+                }
+            )
+        return outputs
+
+    for channel, shape in _SLM_PIXEL_SHAPE.items():
+        outputs.append(
+            {
+                "index": channel,
+                "name": _WINDOW_TITLES.get(channel, f"HDMI-{channel}"),
+                "resolution": (shape[1], shape[0]),
+                "position": None,
+            }
+        )
+    return outputs
 
 
 def read_from_camera() -> np.ndarray:
@@ -198,10 +331,22 @@ def write_to_hdmi(picture: np.ndarray, channel: int) -> None:
     The latest frame is kept on screen by a background thread so this call
     returns immediately.
     """
-    if channel not in _SLM_PIXEL_SHAPE:
-        raise NotImplementedError(f"Unsupported HDMI channel {channel}")
+    if _IS_WINDOWS:
+        monitors = _enumerate_windows_monitors()
+        if not monitors:
+            raise RuntimeError("No active Windows displays found")
+        if channel < 1 or channel > len(monitors):
+            raise ValueError(f"Unsupported HDMI output {channel}. Choose 1-{len(monitors)}.")
+        monitor = monitors[channel - 1]
+        expected_shape = (monitor.height, monitor.width)
+        window_name = f"HDMI-{channel} / {monitor.display_name}"
+    else:
+        if channel not in _SLM_PIXEL_SHAPE:
+            raise NotImplementedError(f"Unsupported HDMI channel {channel}")
+        expected_shape = _SLM_PIXEL_SHAPE[channel]
+        window_name = _WINDOW_TITLES[channel]
+        monitor = None
 
-    expected_shape = _SLM_PIXEL_SHAPE[channel]
     frame = np.asarray(picture)
 
     if frame.ndim == 3 and frame.shape[-1] == 1:
@@ -234,7 +379,12 @@ def write_to_hdmi(picture: np.ndarray, channel: int) -> None:
     with _display_threads_lock:
         displayer = _display_threads.get(channel)
         if displayer is None or not displayer.is_alive():
-            displayer = _HDMIDisplayer(channel=channel, expected_shape=expected_shape)
+            displayer = _HDMIDisplayer(
+                channel=channel,
+                expected_shape=expected_shape,
+                window_name=window_name,
+                monitor=monitor,
+            )
             displayer.start()
             _display_threads[channel] = displayer
 
