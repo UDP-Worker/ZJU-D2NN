@@ -208,3 +208,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# datasets
+data/
+**/data/
+data/**
+
+# MNIST specifically (if你只想忽略MNIST)
+data/MNIST/
+data/MNIST/**
+
+# checkpoints / logs
+checkpoints/
+**/checkpoints/
+*.pt
+*.pth
