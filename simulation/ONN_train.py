@@ -14,12 +14,18 @@ import math
 import argparse
 from pathlib import Path
 import sys
+from typing import Sequence, Tuple
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 # Ensure we can import system.py from the same folder
 THIS_DIR = Path(__file__).resolve().parent
@@ -95,20 +101,28 @@ def make_readout_rois(
     return torch.tensor(rois, dtype=torch.long)  # (10,4)
 
 
+def make_roi_slices(rois: torch.Tensor) -> list[Tuple[slice, slice]]:
+    """
+    Convert ROI tensor to python slice pairs for fast indexing without GPU sync.
+    """
+    rois_cpu = rois.to(device="cpu", dtype=torch.long)
+    slices: list[Tuple[slice, slice]] = []
+    for y0, y1, x0, x1 in rois_cpu.tolist():
+        slices.append((slice(int(y0), int(y1)), slice(int(x0), int(x1))))
+    return slices
+
+
 def readout_logits_from_intensity(
     I_cam: torch.Tensor,     # (B,H,W) float
-    rois: torch.Tensor,      # (10,4) long: y0,y1,x0,x1
+    roi_slices: Sequence[Tuple[slice, slice]],
     mode: str = "mean",      # "mean" or "sum"
 ) -> torch.Tensor:
     """
     Convert camera intensity to logits (B,10) by ROI energy.
     """
-    rois = rois.to(device=I_cam.device, dtype=torch.long)
-
     logits = []
-    for k in range(10):
-        y0, y1, x0, x1 = rois[k].tolist()
-        patch = I_cam[:, y0:y1, x0:x1]  # (B,bh,bw)
+    for y_slice, x_slice in roi_slices:
+        patch = I_cam[:, y_slice, x_slice]  # (B,bh,bw)
         if mode == "sum":
             s = patch.sum(dim=(-2, -1))
         else:
@@ -186,27 +200,31 @@ class TrainONNSystem(nn.Module):
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model: TrainONNSystem, loader, rois, device):
+def evaluate(model: TrainONNSystem, loader, roi_slices, device, show_progress: bool):
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_n = 0
 
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+    non_blocking = (device.type == "cuda")
+    pbar = iter_with_progress(loader, desc="Eval", enabled=show_progress)
+    for images, labels in pbar:
+        images = images.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
 
-        U_slm1 = encode_mnist_to_slm1_phase_field(images).to(device)
+        U_slm1 = encode_mnist_to_slm1_phase_field(images)
         U_cam = model(U_slm1)
-        I_cam = system.intensity(U_cam).to(torch.float32)
+        I_cam = system.intensity(U_cam)
 
-        logits = readout_logits_from_intensity(I_cam, rois, mode="mean")
+        logits = readout_logits_from_intensity(I_cam, roi_slices, mode="mean")
         loss = F.cross_entropy(logits, labels)
 
         pred = logits.argmax(dim=1)
         total_correct += int((pred == labels).sum().item())
         total_loss += float(loss.item()) * images.size(0)
         total_n += images.size(0)
+        if hasattr(pbar, "set_postfix"):
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return total_loss / max(total_n, 1), total_correct / max(total_n, 1)
 
@@ -229,6 +247,26 @@ def select_device(no_cuda: bool) -> torch.device:
 
     return torch.device("cpu")
 
+def log_device_info(device: torch.device, no_cuda: bool) -> None:
+    if device.type == "cuda":
+        name = torch.cuda.get_device_name(device)
+        cap_major, cap_minor = torch.cuda.get_device_capability(device)
+        print(f"[INFO] cuda device = {name} (cc {cap_major}.{cap_minor})")
+        return
+    if not no_cuda:
+        print(
+            "[WARN] CUDA not available. "
+            f"torch.backends.cuda.is_built()={torch.backends.cuda.is_built()} "
+            f"torch.version.cuda={torch.version.cuda} "
+            f"device_count={torch.cuda.device_count()}"
+        )
+
+
+def iter_with_progress(loader, desc: str, enabled: bool):
+    if not enabled or tqdm is None:
+        return loader
+    return tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -244,6 +282,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--no_progress", action="store_true", help="disable tqdm progress bars")
 
     # readout ROI
     parser.add_argument("--roi_box", type=int, default=32, help="ROI box size (square), e.g. 16/32/64")
@@ -257,6 +296,7 @@ def main():
 
     device = select_device(args.no_cuda)
     print(f"[INFO] device = {device}")
+    log_device_info(device, args.no_cuda)
 
     # MNIST
     tfm = transforms.ToTensor()
@@ -264,6 +304,8 @@ def main():
     test_set = datasets.MNIST(args.data_dir, train=False, download=True, transform=tfm)
 
     pin = (device.type == "cuda")  # pin_memory only helps CUDA
+    non_blocking = pin
+    persistent = args.num_workers > 0
 
     train_loader = DataLoader(
         train_set,
@@ -271,6 +313,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin,
+        persistent_workers=persistent,
     )
     test_loader = DataLoader(
         test_set,
@@ -278,6 +321,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin,
+        persistent_workers=persistent,
     )
 
     # slm2 init
@@ -297,7 +341,8 @@ def main():
         box_hw=(args.roi_box, args.roi_box),
         x_range=(0.15, 0.85),
         y_center_frac=0.5,
-    ).to(device)
+    )
+    roi_slices = make_roi_slices(rois)
 
     # optimizer (ONLY SLM2)
     optimizer = torch.optim.Adam([model.slm2_param], lr=args.lr)
@@ -308,15 +353,20 @@ def main():
         running_loss = 0.0
         running_n = 0
 
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+        pbar = iter_with_progress(
+            train_loader,
+            desc=f"Train {epoch:02d}/{args.epochs}",
+            enabled=not args.no_progress,
+        )
+        for images, labels in pbar:
+            images = images.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
 
-            U_slm1 = encode_mnist_to_slm1_phase_field(images).to(device)
+            U_slm1 = encode_mnist_to_slm1_phase_field(images)
             U_cam = model(U_slm1)
-            I_cam = system.intensity(U_cam).to(torch.float32)
+            I_cam = system.intensity(U_cam)
 
-            logits = readout_logits_from_intensity(I_cam, rois, mode="mean")
+            logits = readout_logits_from_intensity(I_cam, roi_slices, mode="mean")
             loss = F.cross_entropy(logits, labels)
 
             optimizer.zero_grad(set_to_none=True)
@@ -325,9 +375,17 @@ def main():
 
             running_loss += float(loss.item()) * images.size(0)
             running_n += images.size(0)
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         train_loss = running_loss / max(running_n, 1)
-        test_loss, test_acc = evaluate(model, test_loader, rois, device)
+        test_loss, test_acc = evaluate(
+            model,
+            test_loader,
+            roi_slices,
+            device,
+            show_progress=not args.no_progress,
+        )
 
         print(f"[Epoch {epoch:02d}/{args.epochs}] "
               f"train_loss={train_loss:.4f}  test_loss={test_loss:.4f}  test_acc={test_acc*100:.2f}%")

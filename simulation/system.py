@@ -164,6 +164,7 @@ class FreePropagation(nn.Module):
         self.cdtype = dtype
 
         self._grid_cache = {}  # keyed by (H,W,device)
+        self._tf_cache = {}    # keyed by (H,W,device)
 
     def _freq_grids(self, H: int, W: int, device):
         key = (H, W, device.type, device.index)
@@ -176,6 +177,24 @@ class FreePropagation(nn.Module):
         self._grid_cache[key] = (FX, FY)
         return FX, FY
 
+    def _transfer_function(self, H: int, W: int, device):
+        key = (H, W, device.type, device.index, self.cdtype)
+        if key in self._tf_cache:
+            return self._tf_cache[key]
+
+        FX, FY = self._freq_grids(H, W, device)
+
+        lam = self.wavelength
+        k = 2.0 * math.pi / lam
+
+        # kz = k * sqrt(1 - (λfx)^2 - (λfy)^2) with complex sqrt (evanescent included)
+        arg = (1.0 - (lam * FX) ** 2 - (lam * FY) ** 2).to(self.cdtype)
+        kz = k * torch.sqrt(arg)
+        Htf = torch.exp(1j * kz * self.distance)
+
+        self._tf_cache[key] = Htf
+        return Htf
+
     def forward(self, U1: torch.Tensor) -> torch.Tensor:
         if not torch.is_complex(U1):
             U1 = U1.to(torch.float32).to(self.cdtype)
@@ -183,18 +202,8 @@ class FreePropagation(nn.Module):
             U1 = U1.to(self.cdtype)
 
         device = U1.device
-        z = torch.tensor(self.distance, device=device, dtype=torch.float32)
-
         H, W = U1.shape[-2], U1.shape[-1]
-        FX, FY = self._freq_grids(H, W, device)
-
-        lam = self.wavelength
-        k = 2.0 * math.pi / lam
-
-        # kz = k * sqrt(1 - (λfx)^2 - (λfy)^2) with complex sqrt (evanescent included)
-        arg = (1.0 - (lam * FX) ** 2 - (lam * FY) ** 2).to(torch.complex64)
-        kz = k * torch.sqrt(arg)
-        Htf = torch.exp(1j * kz * z)
+        Htf = self._transfer_function(H, W, device)
 
         U1_f = torch.fft.fft2(U1)
         U2 = torch.fft.ifft2(U1_f * Htf)
@@ -227,6 +236,7 @@ class LensPropagation(nn.Module):
         self.cdtype = dtype
 
         self._coord_cache = {}  # keyed by (H,W,device)
+        self._lens_cache = {}   # keyed by (H,W,device)
 
     def _coord_grids(self, H: int, W: int, device):
         key = (H, W, device.type, device.index)
@@ -239,6 +249,20 @@ class LensPropagation(nn.Module):
         self._coord_cache[key] = (X, Y)
         return X, Y
 
+    def _lens_phase(self, H: int, W: int, device):
+        key = (H, W, device.type, device.index, self.cdtype)
+        if key in self._lens_cache:
+            return self._lens_cache[key]
+
+        X, Y = self._coord_grids(H, W, device)
+        lam = self.wavelength
+        k = 2.0 * math.pi / lam
+        phase = -(k / (2.0 * self.f)) * (X ** 2 + Y ** 2)
+        H_lens = torch.exp(1j * phase)
+
+        self._lens_cache[key] = H_lens
+        return H_lens
+
     def forward(self, U: torch.Tensor) -> torch.Tensor:
         if not torch.is_complex(U):
             U = U.to(torch.float32).to(self.cdtype)
@@ -247,12 +271,7 @@ class LensPropagation(nn.Module):
 
         device = U.device
         H, W = U.shape[-2], U.shape[-1]
-        X, Y = self._coord_grids(H, W, device)
-
-        lam = self.wavelength
-        k = 2.0 * math.pi / lam
-        phase = -(k / (2.0 * self.f)) * (X ** 2 + Y ** 2)
-        H_lens = torch.exp(1j * phase)
+        H_lens = self._lens_phase(H, W, device)
 
         return U * H_lens
 
