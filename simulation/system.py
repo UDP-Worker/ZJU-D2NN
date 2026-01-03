@@ -1,65 +1,111 @@
 # simulation/system.py
 # ------------------------------------------------------------
-# Optical propagation system for simulation:
-#   SLM1 -> (free) -> L1 (f=250mm) -> (free) -> SLM2
-#   SLM2 -> (free) -> L2 (f=250mm) -> (free) -> Sensor (camera)
+# Optical propagation system (simulation):
+#   SLM1 (1024x768, 12.5um) -> free -> L1 (f=250mm) -> free -> SLM2 (1280x720, 6.3um)
+#   SLM2 -> free -> L2 (f=250mm) -> free -> Sensor (camera, 3072x2048, 2.4um)
 #
-# Notes:
-# - Pure simulation: no calibration, no learnable offsets/tilts.
-# - Camera has NO camera lens; sensor measures intensity |U|^2.
-# - Unknown parameters are left as None with TODO marks.
+# - Uses Angular Spectrum Method (ASM) for free-space propagation.
+# - Uses thin-lens quadratic phase for lenses.
+# - NO OffsetProcess (no shift/tilt).
+# - Different pixel pitches are handled via complex-field resampling (real/imag interpolated).
+# - Camera has NO camera lens (just propagation to sensor).
 # ------------------------------------------------------------
 
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 # ============================================================
 # Parameters (edit here)
 # ============================================================
 
-# ---- Fundamental optical parameters ----
-WAVELENGTH = None  # TODO: wavelength in meters, e.g. 532e-9 / 633e-9 / 1550e-9
+# ---- Wavelength ----
+WAVELENGTH = 532e-9  # meters (~532 nm)
 
-# ---- Sampling pitch on the simulation grid (meters per pixel) ----
-DX = None  # TODO: meters/pixel in x (SLM/camera plane sampling)
-DY = None  # TODO: meters/pixel in y
+# ---- Pixel pitches (square pixels) ----
+PITCH_SLM1 = 12.5e-6  # meters / pixel
+PITCH_SLM2 = 6.3e-6   # meters / pixel
+PITCH_CAM  = 2.4e-6   # meters / pixel
+
+# ---- Resolutions (W x H in common display specs; here we store H, W) ----
+H_SLM1, W_SLM1 = 768, 1024
+H_SLM2, W_SLM2 = 720, 1280
+H_CAM,  W_CAM  = 2048, 3072
+
+# ---- Sampling on each plane ----
+DX1 = DY1 = PITCH_SLM1
+DX2 = DY2 = PITCH_SLM2
+DXC = DYC = PITCH_CAM
 
 # ---- 4f lens focal length (given) ----
 F_4F = 250e-3  # 250 mm = 0.25 m
 
 # ---- Distances (meters) ----
-# First half: SLM1 -> L1 -> SLM2
-# In an ideal 4f, these are typically f and f; we set defaults accordingly.
+# First half: ideal 4f half
 SLM1_TO_L1 = F_4F
 L1_TO_SLM2 = F_4F
 
-# Second half: SLM2 -> L2 -> Sensor (NO camera lens)
+# Second half: ideal 4f half to L2
 SLM2_TO_L2 = F_4F
-L2_TO_SENSOR = None  # TODO: meters, distance from L2 to sensor plane
 
-# ---- Numeric dtype ----
-CDTYPE = torch.complex64  # complex64 is usually enough and faster
+# L2 -> sensor distance (hard to know in real setup):
+# A standard, reasonable simulation default is placing sensor at L2 back focal plane.
+L2_TO_SENSOR = F_4F  # TODO: change if you want a different observation plane
+
+# ---- Complex dtype ----
+CDTYPE = torch.complex64
 
 
 # ============================================================
-# Utilities
+# Small helpers
 # ============================================================
 
-def _require_not_none(name: str, value):
-    if value is None:
-        raise ValueError(f"Parameter `{name}` is None. Please set it in system.py.")
-    return value
+def intensity(U: torch.Tensor) -> torch.Tensor:
+    """Sensor intensity: I = |U|^2."""
+    return U.real * U.real + U.imag * U.imag
 
 
-def intensity(field: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+# ============================================================
+# Resampling between different pixel pitches / resolutions
+# ============================================================
+
+class ComplexResample(nn.Module):
     """
-    Sensor measures intensity: I = |U|^2.
+    Resample complex field from (H_in, W_in) to (H_out, W_out).
+    Interpolate real and imaginary parts separately.
+
+    Input:  (..., H_in, W_in) complex
+    Output: (..., H_out, W_out) complex
     """
-    I = field.real * field.real + field.imag * field.imag
-    if eps > 0:
-        I = I + eps
-    return I
+    def __init__(self, out_hw: tuple[int, int], mode: str = "bilinear", align_corners: bool = False):
+        super().__init__()
+        self.out_hw = out_hw
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, U: torch.Tensor) -> torch.Tensor:
+        if not torch.is_complex(U):
+            raise TypeError("ComplexResample expects a complex tensor (complex64/complex128).")
+
+        *lead, H, W = U.shape
+        B = 1
+        for d in lead:
+            B *= int(d)
+
+        Ur = U.real.reshape(B, 1, H, W)
+        Ui = U.imag.reshape(B, 1, H, W)
+        X = torch.cat([Ur, Ui], dim=1)  # (B,2,H,W)
+
+        if self.mode in ("bilinear", "bicubic", "trilinear"):
+            Y = F.interpolate(X, size=self.out_hw, mode=self.mode, align_corners=self.align_corners)
+        else:
+            Y = F.interpolate(X, size=self.out_hw, mode=self.mode)
+
+        H2, W2 = self.out_hw
+        Yr = Y[:, 0:1].reshape(*lead, H2, W2)
+        Yi = Y[:, 1:2].reshape(*lead, H2, W2)
+        return torch.complex(Yr, Yi)
 
 
 # ============================================================
@@ -79,63 +125,49 @@ class FreePropagation(nn.Module):
         dx: float,
         dy: float,
         distance: float,
-        learnable_z: bool = False,
         dtype: torch.dtype = torch.complex64,
     ):
         super().__init__()
         self.wavelength = float(wavelength)
         self.dx = float(dx)
         self.dy = float(dy)
+        self.distance = float(distance)
         self.cdtype = dtype
 
-        # log(z) ensures z > 0
-        z0 = torch.tensor(float(distance), dtype=torch.float32)
-        if learnable_z:
-            self.log_z = nn.Parameter(torch.log(z0))
-        else:
-            self.register_buffer("log_z", torch.log(z0), persistent=True)
+        self._grid_cache = {}  # keyed by (H,W,device)
 
-        # cache frequency grids per (H,W,device)
-        self._grid_cache = {}
-
-    def _get_z(self) -> torch.Tensor:
-        return torch.exp(self.log_z)
-
-    def _freq_grids(self, H: int, W: int, device, dtype_real=torch.float32):
-        key = (H, W, device.type, device.index, dtype_real)
+    def _freq_grids(self, H: int, W: int, device):
+        key = (H, W, device.type, device.index)
         if key in self._grid_cache:
             return self._grid_cache[key]
 
-        fx = torch.fft.fftfreq(W, d=self.dx, device=device, dtype=dtype_real)  # cycles/m
-        fy = torch.fft.fftfreq(H, d=self.dy, device=device, dtype=dtype_real)
+        fx = torch.fft.fftfreq(W, d=self.dx, device=device, dtype=torch.float32)  # cycles/m
+        fy = torch.fft.fftfreq(H, d=self.dy, device=device, dtype=torch.float32)
         FY, FX = torch.meshgrid(fy, fx, indexing="ij")  # (H,W)
-
         self._grid_cache[key] = (FX, FY)
         return FX, FY
 
-    def forward(self, inputE: torch.Tensor) -> torch.Tensor:
-        if not torch.is_complex(inputE):
-            inputE = inputE.to(torch.float32).to(self.cdtype)
-        elif inputE.dtype != self.cdtype:
-            inputE = inputE.to(self.cdtype)
+    def forward(self, U1: torch.Tensor) -> torch.Tensor:
+        if not torch.is_complex(U1):
+            U1 = U1.to(torch.float32).to(self.cdtype)
+        elif U1.dtype != self.cdtype:
+            U1 = U1.to(self.cdtype)
 
-        device = inputE.device
-        z = self._get_z().to(device=device, dtype=torch.float32)
+        device = U1.device
+        z = torch.tensor(self.distance, device=device, dtype=torch.float32)
 
-        H, W = inputE.shape[-2], inputE.shape[-1]
-        FX, FY = self._freq_grids(H, W, device=device, dtype_real=torch.float32)
+        H, W = U1.shape[-2], U1.shape[-1]
+        FX, FY = self._freq_grids(H, W, device)
 
         lam = self.wavelength
         k = 2.0 * math.pi / lam
 
-        # kz = k * sqrt(1 - (λfx)^2 - (λfy)^2)
-        # Use complex sqrt to include evanescent waves (decay).
+        # kz = k * sqrt(1 - (λfx)^2 - (λfy)^2) with complex sqrt (evanescent included)
         arg = (1.0 - (lam * FX) ** 2 - (lam * FY) ** 2).to(torch.complex64)
         kz = k * torch.sqrt(arg)
-
         Htf = torch.exp(1j * kz * z)
 
-        U1_f = torch.fft.fft2(inputE)
+        U1_f = torch.fft.fft2(U1)
         U2 = torch.fft.ifft2(U1_f * Htf)
         return U2
 
@@ -153,7 +185,6 @@ class LensPropagation(nn.Module):
         dx: float,
         dy: float,
         focal_length: float,
-        learnable_f: bool = False,
         dtype: torch.dtype = torch.complex64,
     ):
         super().__init__()
@@ -163,112 +194,86 @@ class LensPropagation(nn.Module):
         self.wavelength = float(wavelength)
         self.dx = float(dx)
         self.dy = float(dy)
+        self.f = float(focal_length)
         self.cdtype = dtype
 
-        # log(f) if needed; for simulation usually fixed
-        f0 = torch.tensor(float(focal_length), dtype=torch.float32)
-        if learnable_f:
-            self.log_f = nn.Parameter(torch.log(f0))
-        else:
-            self.register_buffer("log_f", torch.log(f0), persistent=True)
+        self._coord_cache = {}  # keyed by (H,W,device)
 
-        # cache coordinate grids per (H,W,device)
-        self._coord_cache = {}
-
-    def _get_f(self) -> torch.Tensor:
-        return torch.exp(self.log_f)
-
-    def _coord_grids(self, H: int, W: int, device, dtype_real=torch.float32):
-        key = (H, W, device.type, device.index, dtype_real)
+    def _coord_grids(self, H: int, W: int, device):
+        key = (H, W, device.type, device.index)
         if key in self._coord_cache:
             return self._coord_cache[key]
 
-        xs = (torch.arange(W, device=device, dtype=dtype_real) - (W // 2)) * self.dx
-        ys = (torch.arange(H, device=device, dtype=dtype_real) - (H // 2)) * self.dy
+        xs = (torch.arange(W, device=device, dtype=torch.float32) - (W // 2)) * self.dx
+        ys = (torch.arange(H, device=device, dtype=torch.float32) - (H // 2)) * self.dy
         Y, X = torch.meshgrid(ys, xs, indexing="ij")
-
         self._coord_cache[key] = (X, Y)
         return X, Y
 
-    def forward(self, inputE: torch.Tensor) -> torch.Tensor:
-        if not torch.is_complex(inputE):
-            inputE = inputE.to(torch.float32).to(self.cdtype)
-        elif inputE.dtype != self.cdtype:
-            inputE = inputE.to(self.cdtype)
+    def forward(self, U: torch.Tensor) -> torch.Tensor:
+        if not torch.is_complex(U):
+            U = U.to(torch.float32).to(self.cdtype)
+        elif U.dtype != self.cdtype:
+            U = U.to(self.cdtype)
 
-        device = inputE.device
-        f = self._get_f().to(device=device, dtype=torch.float32)
-
-        H, W = inputE.shape[-2], inputE.shape[-1]
-        X, Y = self._coord_grids(H, W, device=device, dtype_real=torch.float32)
+        device = U.device
+        H, W = U.shape[-2], U.shape[-1]
+        X, Y = self._coord_grids(H, W, device)
 
         lam = self.wavelength
         k = 2.0 * math.pi / lam
-        phase = -(k / (2.0 * f)) * (X ** 2 + Y ** 2)
+        phase = -(k / (2.0 * self.f)) * (X ** 2 + Y ** 2)
         H_lens = torch.exp(1j * phase)
 
-        return inputE * H_lens
+        return U * H_lens
 
 
 # ============================================================
-# System builders
+# System construction
 # ============================================================
 
 def build_first_half_model(dtype: torch.dtype = CDTYPE) -> nn.Module:
     """
-    SLM1 -> L1 -> SLM2
+    SLM1 -> free(z=f) -> L1(f) -> resample to SLM2 grid -> free(z=f) -> SLM2
     """
-    lam = _require_not_none("WAVELENGTH", WAVELENGTH)
-    dx = _require_not_none("DX", DX)
-    dy = _require_not_none("DY", DY)
-
-    z1 = _require_not_none("SLM1_TO_L1", SLM1_TO_L1)
-    z2 = _require_not_none("L1_TO_SLM2", L1_TO_SLM2)
-
     return nn.Sequential(
-        FreePropagation(lam, dx, dy, z1, learnable_z=False, dtype=dtype),
-        LensPropagation(lam, dx, dy, F_4F, learnable_f=False, dtype=dtype),
-        FreePropagation(lam, dx, dy, z2, learnable_z=False, dtype=dtype),
+        FreePropagation(WAVELENGTH, DX1, DY1, SLM1_TO_L1, dtype=dtype),
+        LensPropagation(WAVELENGTH, DX1, DY1, F_4F, dtype=dtype),
+        ComplexResample(out_hw=(H_SLM2, W_SLM2), mode="bilinear", align_corners=False),
+        FreePropagation(WAVELENGTH, DX2, DY2, L1_TO_SLM2, dtype=dtype),
     )
 
 
 def build_second_half_model(dtype: torch.dtype = CDTYPE) -> nn.Module:
     """
-    SLM2 -> L2 -> Sensor (no camera lens)
+    SLM2 -> free(z=f) -> L2(f) -> resample to camera grid -> free(z=L2_TO_SENSOR) -> sensor
     """
-    lam = _require_not_none("WAVELENGTH", WAVELENGTH)
-    dx = _require_not_none("DX", DX)
-    dy = _require_not_none("DY", DY)
-
-    z3 = _require_not_none("SLM2_TO_L2", SLM2_TO_L2)
-    z4 = _require_not_none("L2_TO_SENSOR", L2_TO_SENSOR)
-
     return nn.Sequential(
-        FreePropagation(lam, dx, dy, z3, learnable_z=False, dtype=dtype),
-        LensPropagation(lam, dx, dy, F_4F, learnable_f=False, dtype=dtype),
-        FreePropagation(lam, dx, dy, z4, learnable_z=False, dtype=dtype),
+        FreePropagation(WAVELENGTH, DX2, DY2, SLM2_TO_L2, dtype=dtype),
+        LensPropagation(WAVELENGTH, DX2, DY2, F_4F, dtype=dtype),
+        ComplexResample(out_hw=(H_CAM, W_CAM), mode="bilinear", align_corners=False),
+        FreePropagation(WAVELENGTH, DXC, DYC, L2_TO_SENSOR, dtype=dtype),
     )
 
 
 class OpticalSystem(nn.Module):
     """
-    Full system: SLM1 plane complex field -> sensor intensity.
+    Full system: complex field at SLM1 plane -> sensor intensity.
 
-    forward(input_field):
-        U_slm2 = first_half(input_field)
-        U_sensor = second_half(U_slm2)
-        I_sensor = |U_sensor|^2
+    forward(U_slm1, return_fields=False):
+        U_slm2 = first_half(U_slm1)
+        U_cam_field = second_half(U_slm2)
+        I_cam = |U_cam_field|^2
     """
     def __init__(self, dtype: torch.dtype = CDTYPE):
         super().__init__()
         self.first_half = build_first_half_model(dtype=dtype)
         self.second_half = build_second_half_model(dtype=dtype)
 
-    def forward(self, inputE: torch.Tensor, return_field: bool = False):
-        U_slm2 = self.first_half(inputE)
-        U_sensor = self.second_half(U_slm2)
-        I = intensity(U_sensor)
-
-        if return_field:
-            return I, U_sensor, U_slm2
-        return I
+    def forward(self, U_slm1: torch.Tensor, return_fields: bool = False):
+        U_slm2 = self.first_half(U_slm1)
+        U_cam = self.second_half(U_slm2)
+        I_cam = intensity(U_cam)
+        if return_fields:
+            return I_cam, U_cam, U_slm2
+        return I_cam
