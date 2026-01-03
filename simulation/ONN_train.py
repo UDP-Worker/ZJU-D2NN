@@ -8,12 +8,22 @@ Train SLM2 phase (the "weight" of the optical neural network) for MNIST classifi
 
 Readout:
 - Use 10 ROIs on camera intensity as logits (energy/mean in each ROI).
+
+Practical training controls (because full MNIST epoch is too heavy for large FFT optics):
+- --max_steps: stop training after N steps (each step = one batch forward+backward)
+- --log_every: print loss every N steps
+- --eval_every: run eval every N steps (optional, costly)
+
+Device:
+- supports CUDA / MPS / CPU
 """
 
 import math
 import argparse
 from pathlib import Path
 import sys
+import time
+from typing import Optional
 
 import torch
 from torch import nn
@@ -130,9 +140,9 @@ class TrainONNSystem(nn.Module):
     """
     def __init__(
         self,
-        slm2_init: torch.Tensor | None = None,   # (H_SLM2,W_SLM2) radians
+        slm2_init: Optional[torch.Tensor] = None,  # (H_SLM2,W_SLM2) radians
         slm2_learnable: bool = True,
-        phi_range: float = 2.0 * math.pi,        # map to [0, phi_range)
+        phi_range: float = 2.0 * math.pi,          # map to [0, phi_range)
         init_in_radians: bool = True,
     ):
         super().__init__()
@@ -161,7 +171,7 @@ class TrainONNSystem(nn.Module):
         else:
             self.register_buffer("slm2_param", p0, persistent=True)
 
-        # Freeze system params (safety; system has no learnables by default)
+        # Freeze system params (safety)
         for p in self.sys.parameters():
             p.requires_grad_(False)
 
@@ -186,13 +196,19 @@ class TrainONNSystem(nn.Module):
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model: TrainONNSystem, loader, rois, device):
+def evaluate(model: TrainONNSystem, loader, rois, device, max_batches: int = 0):
+    """
+    Evaluation over the test loader.
+    max_batches=0 means full test set; otherwise evaluate only first max_batches batches (faster).
+    """
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_n = 0
 
+    nb = 0
     for images, labels in loader:
+        nb += 1
         images = images.to(device)
         labels = labels.to(device)
 
@@ -207,6 +223,9 @@ def evaluate(model: TrainONNSystem, loader, rois, device):
         total_correct += int((pred == labels).sum().item())
         total_loss += float(loss.item()) * images.size(0)
         total_n += images.size(0)
+
+        if max_batches > 0 and nb >= max_batches:
+            break
 
     return total_loss / max(total_n, 1), total_correct / max(total_n, 1)
 
@@ -237,13 +256,19 @@ def main():
     parser.add_argument("--save_name", type=str, default="onn_slm2.pt")
 
     # training
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=999, help="epochs upper bound; real stop is controlled by --max_steps")
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--batch_size", type=int, default=1)          # camera plane is huge
     parser.add_argument("--test_batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
+
+    # practical stop / logs
+    parser.add_argument("--max_steps", type=int, default=500, help="stop after N training steps (1 step = 1 batch forward+backward)")
+    parser.add_argument("--log_every", type=int, default=20, help="print loss every N steps")
+    parser.add_argument("--eval_every", type=int, default=0, help="run evaluation every N steps (0 disables)")
+    parser.add_argument("--eval_batches", type=int, default=10, help="when eval_every>0, eval only first N test batches for speed (0=full test)")
 
     # readout ROI
     parser.add_argument("--roi_box", type=int, default=32, help="ROI box size (square), e.g. 16/32/64")
@@ -303,12 +328,17 @@ def main():
     optimizer = torch.optim.Adam([model.slm2_param], lr=args.lr)
 
     # train
+    global_step = 0
+    start_time = time.time()
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
         running_n = 0
 
         for images, labels in train_loader:
+            global_step += 1
+
             images = images.to(device)
             labels = labels.to(device)
 
@@ -326,11 +356,30 @@ def main():
             running_loss += float(loss.item()) * images.size(0)
             running_n += images.size(0)
 
-        train_loss = running_loss / max(running_n, 1)
-        test_loss, test_acc = evaluate(model, test_loader, rois, device)
+            if global_step % args.log_every == 0:
+                elapsed = time.time() - start_time
+                avg_loss = running_loss / max(running_n, 1)
+                print(f"[epoch {epoch} step {global_step}] loss={loss.item():.4f}  avg_loss={avg_loss:.4f}  elapsed={elapsed/60:.1f}min")
 
-        print(f"[Epoch {epoch:02d}/{args.epochs}] "
-              f"train_loss={train_loss:.4f}  test_loss={test_loss:.4f}  test_acc={test_acc*100:.2f}%")
+            if args.eval_every > 0 and (global_step % args.eval_every == 0):
+                test_loss, test_acc = evaluate(
+                    model, test_loader, rois, device,
+                    max_batches=(0 if args.eval_batches <= 0 else args.eval_batches)
+                )
+                print(f"[eval step {global_step}] test_loss={test_loss:.4f}  test_acc={test_acc*100:.2f}%")
+
+            if global_step >= args.max_steps:
+                break
+
+        if global_step >= args.max_steps:
+            break
+
+    # final quick eval (optional)
+    test_loss, test_acc = evaluate(
+        model, test_loader, rois, device,
+        max_batches=(0 if args.eval_batches <= 0 else args.eval_batches)
+    )
+    print(f"[FINAL eval] test_loss={test_loss:.4f}  test_acc={test_acc*100:.2f}%")
 
     # save
     save_dir = Path(args.save_dir)
